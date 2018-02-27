@@ -1,6 +1,6 @@
 /*
- *   Copyright (C) 2009-2016 by Jonathan Naylor G4KLX
- *   Copyright (C) 2016,2017 by Andy Uribe CA6JAU
+ *   Copyright (C) 2009-2017 by Jonathan Naylor G4KLX
+ *   Copyright (C) 2017 by Andy Uribe CA6JAU
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -26,6 +26,13 @@
 const uint8_t BIT_SYNC = 0xAAU;
 
 const uint8_t FRAME_SYNC[] = {0xEAU, 0xA6U, 0x00U};
+
+// Generated using gaussfir(0.35, 1, 5) in MATLAB
+static q15_t GAUSSIAN_0_35_FILTER[] = {0, 0, 0, 0, 1001, 3514, 9333, 18751, 28499, 32767, 28499, 18751, 9333, 3514, 1001}; // numTaps = 15, L = 5
+const uint16_t GAUSSIAN_0_35_FILTER_PHASE_LEN = 3U; // phaseLength = numTaps/L
+
+const q15_t DSTAR_LEVEL0 = -841;
+const q15_t DSTAR_LEVEL1 =  841;
 
 const uint8_t BIT_MASK_TABLE[] = {0x80U, 0x40U, 0x20U, 0x10U, 0x08U, 0x04U, 0x02U, 0x01U};
 
@@ -182,13 +189,19 @@ const uint8_t DSTAR_EOT    = 0x02U;
 
 CDStarTX::CDStarTX() :
 m_buffer(),
+m_modFilter(),
+m_modState(),
 m_poBuffer(),
 m_poLen(0U),
 m_poPtr(0U),
-m_txDelay(60U),      // 100ms
-m_count(0U)
+m_txDelay(60U)       // 100ms
 {
+  ::memset(m_modState, 0x00U, 20U * sizeof(q15_t));
 
+  m_modFilter.L           = DSTAR_RADIO_SYMBOL_LENGTH;
+  m_modFilter.phaseLength = GAUSSIAN_0_35_FILTER_PHASE_LEN;
+  m_modFilter.pCoeffs     = GAUSSIAN_0_35_FILTER;
+  m_modFilter.pState      = m_modState;
 }
 
 void CDStarTX::process()
@@ -200,11 +213,9 @@ void CDStarTX::process()
 
   if (type == DSTAR_HEADER && m_poLen == 0U) {
     if (!m_tx) {
-      m_delay = true;
-      m_count = 0U;
-      m_poLen = m_txDelay;
+      for (uint16_t i = 0U; i < m_txDelay; i++)
+        m_poBuffer[m_poLen++] = BIT_SYNC;
     } else {
-      m_delay = false;
       // Pop the type byte off
       m_buffer.get();
 
@@ -227,10 +238,6 @@ void CDStarTX::process()
   }
  
   if (type == DSTAR_DATA && m_poLen == 0U) {
-    m_delay = false;
-    if (!m_tx)
-      m_count = 0U;
-
     // Pop the type byte off
     m_buffer.get();
 
@@ -241,13 +248,12 @@ void CDStarTX::process()
   }
 
   if (type == DSTAR_EOT && m_poLen == 0U) {
-    m_delay = false;
     // Pop the type byte off
     m_buffer.get();
 
     for (uint8_t j = 0U; j < 3U; j++) {
-      for (uint8_t i = 0U; i < DSTAR_EOT_LENGTH_BYTES; i++)
-        m_poBuffer[m_poLen++] = DSTAR_EOT_BYTES[i];
+      for (uint8_t i = 0U; i < DSTAR_END_SYNC_LENGTH_BYTES; i++)
+        m_poBuffer[m_poLen++] = DSTAR_END_SYNC_BYTES[i];
     }
      
     m_poPtr = 0U;
@@ -256,20 +262,15 @@ void CDStarTX::process()
   if (m_poLen > 0U) {
     uint16_t space = io.getSpace();
     
-    while (space > 8U) {
-      if (m_delay) {
-        m_poPtr++;
-        writeByte(BIT_SYNC);
-      }
-      else
-        writeByte(m_poBuffer[m_poPtr++]);    
+    while (space > (8U * DSTAR_RADIO_SYMBOL_LENGTH)) {
+      uint8_t c = m_poBuffer[m_poPtr++];
+      writeByte(c);
 
-      space -= 8U;
+      space -= 8U * DSTAR_RADIO_SYMBOL_LENGTH;
       
       if (m_poPtr >= m_poLen) {
         m_poPtr = 0U;
         m_poLen = 0U;
-        m_delay = false;
         return;
       }
     }
@@ -410,27 +411,35 @@ void CDStarTX::txHeader(const uint8_t* in, uint8_t* out) const
 
 void CDStarTX::writeByte(uint8_t c)
 {
-  uint8_t bit;
+  q15_t inBuffer[8U];
+  q15_t outBuffer[DSTAR_RADIO_SYMBOL_LENGTH * 8U];
+
   uint8_t mask = 0x01U;
-  
+
   for (uint8_t i = 0U; i < 8U; i++) {
     if ((c & mask) == mask)
-      bit = 1U;
+      inBuffer[i] = DSTAR_LEVEL0;
     else
-      bit = 0U;
+      inBuffer[i] = DSTAR_LEVEL1;
 
-    io.write(&bit, 1);
     mask <<= 1;
   }
 
+  ::arm_fir_interpolate_q15(&m_modFilter, inBuffer, outBuffer, 8U);
+  
+  io.write(STATE_DSTAR, outBuffer, DSTAR_RADIO_SYMBOL_LENGTH * 8U);
 }
 
 void CDStarTX::setTXDelay(uint8_t delay)
 {
-  m_txDelay = 150U + uint16_t(delay) * 6U;        // 250ms + tx delay
+  m_txDelay = 300U + uint16_t(delay) * 6U;        // 250ms + tx delay
+
+  if (m_txDelay > 600U)
+    m_txDelay = 600U;
 }
 
-uint16_t CDStarTX::getSpace() const
+uint8_t CDStarTX::getSpace() const
 {
   return m_buffer.getSpace() / (DSTAR_DATA_LENGTH_BYTES + 1U);
 }
+
